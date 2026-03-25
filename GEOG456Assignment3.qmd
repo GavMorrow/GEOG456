@@ -1,0 +1,783 @@
+---
+title: "Migration Flows "
+subtitle: "Source: American Community Survey 2023"
+author: "Gavin Morrow"
+date: today
+date-format: "MMM D, YYYY"
+format:   
+  html:
+    embed-resources: true 
+    toc: true
+    code-fold: true    
+    code-overflow: wrap
+    number-sections: true
+---
+
+```{r}
+#| output: false
+library(ipumsr)
+library(tidyverse)
+library(gt)
+library(scales)
+library(sf) 
+
+# wkdir is the root of your project directory
+wkdir <- here::here()
+
+# set directories for where you store data and save plots relative to project root
+dataDir <- file.path(wkdir, "data")  #read data file dir
+plotsDir <- file.path(wkdir, "plots")  #save plot files dir
+
+options(scipen=99, digits=5)
+
+# create plots directory if it does not exist
+ifelse(!dir.exists(file.path(wkdir, "plots")), dir.create(file.path(wkdir, "plots")), FALSE)
+
+
+options(scipen=99, digits = 5)
+```
+
+```{r}
+#| output: false
+
+if (!require("ipumsr")) stop("Reading IPUMS data into R requires the ipumsr package. It can be installed using the following command: install.packages('ipumsr')")
+
+dataSet <- "usa_00001.xml"  # name of YOUR 2023 xml file
+
+ddi <- read_ipums_ddi(file.path(dataDir,dataSet)) # ACS 2023
+data <- read_ipums_micro(ddi)
+data <- data %>% 
+  filter(YEAR != 2000)
+
+# extract variable names the traditional way (useful reference)
+varname <- as.data.frame(colnames(data))
+
+# create webpage of variable names, labels and values, save it as dataSet.html in the data directory
+# useful for reference
+ipums_view(ddi, launch = FALSE, out_file=file.path(wkdir, "data", paste0(dataSet,".html" )))
+
+# add a state name variable to data 
+# first, create a dataframe with statefips codes (as val) and statenames (as lbl) from variable STATEIP
+STATES <- ipums_val_labels(ddi, STATEFIP) 
+
+# then, join STATES to data (using: STATEFIP=val) and rename new variable lbl as STATENAME
+data <- data %>% 
+  left_join(select(STATES, STATEFIP=val, STATENAME=lbl))
+
+# drop those who lived outside the US 1 year ago and those < 1 year old
+# assign current state of residence to previous state for those who didn't move
+# (i.e. MIGPLAC1=0)
+data <- data %>%
+  filter(AGE >=1, MIGPLAC1<=56) %>% 
+  mutate(MIGPLAC1=case_when(
+    MIGPLAC1 == 0 ~ STATEFIP,
+    TRUE ~ as.integer(MIGPLAC1)))
+
+
+# make a new variable called PREV_STATENAME from MIGPLAC1 labels
+MIGPLAC1 <- ipums_val_labels(ddi, MIGPLAC1)  
+
+# add MIGPLAC1 labels to our data extract as new variable PREV_STATENAME
+data <- data %>% 
+  left_join(select(MIGPLAC1, MIGPLAC1=val, PREV_STATENAME=lbl))
+
+
+## Read Shapefiles
+
+states_shp <- st_read(file.path(wkdir, "Shapefiles", "states_moveAKHI.shp"),"states_moveAKHI", quiet = TRUE)
+
+counties_shp <- st_read(file.path(wkdir, "Shapefiles",
+"counties_moveAKHI.shp"), "counties_moveAKHI", quiet = TRUE)
+```
+
+```{r}
+#| code-fold: false
+
+# create an indicator of interstate migration: mover=1, stayers/non-movers=0
+data <- data %>% 
+  mutate(mover=case_when(STATENAME != PREV_STATENAME ~ 1,
+                         TRUE ~ 0))
+
+print("There should be 51x51=2601 flow observations")
+
+state_flows_acs <- data %>% 
+  filter(mover==1) %>% 
+  group_by(PREV_STATENAME, STATENAME) %>% 
+  summarize(flow=sum(PERWT)) 
+
+print(paste("Group_by produces", nrow(state_flows_acs), "observations only"))
+
+state_flows_acs <- data %>% 
+  filter(mover==1) %>% 
+  group_by(PREV_STATENAME, STATENAME) %>% 
+  summarize(flow=sum(PERWT)) %>% 
+  ungroup() %>% 
+  complete(PREV_STATENAME, STATENAME, fill = list(flow = 0))
+
+print(paste("Group_by produces", nrow(state_flows_acs), "observations by appending 'complete'"))
+  
+```
+
+## Summarize the ACS state flow data
+
+-   Total inmigration to and outmigration from a state
+
+-   Netmigration = inmigration - outmigration
+
+```{r}
+#| code-fold: false
+
+in_out_acs <- state_flows_acs %>% 
+  group_by(PREV_STATENAME) %>% 
+  mutate(outflow_acs=sum(flow)) %>% 
+  group_by(STATENAME) %>% 
+  mutate(inflow_acs=sum(flow)) %>% 
+  select(PREV_STATENAME,STATENAME, outflow_acs, inflow_acs) %>% 
+  filter(PREV_STATENAME==STATENAME) %>% 
+  mutate(netmig_acs=inflow_acs-outflow_acs) %>% 
+  select(-PREV_STATENAME)
+  
+```
+
+## Plot netmigration by state - ACS
+
+Rank states from high to low netmigration (i.e., gainers and losers) in a bar chart
+
+```{r}
+#| code-fold: false
+#| code-line-numbers: "1"
+
+p <- ggplot(data=in_out_acs, aes(y=netmig_acs,x=reorder(STATENAME, desc(netmig_acs)))) +
+  geom_bar(stat="identity") +
+  labs(title = "Netmigration by State, ACS 2021-22") +
+  scale_y_continuous(name="Netmigration", limits=c(-260000,260000), breaks=seq(-260000,2600000, by =80000)) +
+  xlab(" ") +
+  theme(text=element_text(size=14),
+        legend.title=element_blank(),
+        legend.key.size =  unit(0.3, "in"),
+        legend.text = element_text(size=9),
+        plot.title = element_text(size=24,hjust = 0.5),
+        plot.subtitle = element_text(size=18, hjust = 0.5),
+        axis.title.x = element_text(size = 20),
+        axis.title.y = element_text(size = 12),
+        axis.text.x = element_text(size = 8),
+        axis.text.y = element_text(size = 8)) +
+  coord_flip()
+
+```
+
+## Show bar chart
+
+You can see California is a big net loser of migrants; Texas and Florida are big net gainers.
+
+```{r}
+p
+```
+Both Carolinas along with Texas adn Florida pose as big gains but we do see a lot of loss in New Jersey as well as New York and California with their large populations.
+
+## Map netmigration by state - ACS
+
+-   Colors dominated by big states. Netmigration will generally be larger (+ve or -ve) the larger the population of the state.
+-   We will explore ways of accounting for this large state effect later.
+
+```{r}
+# create a 2nd version of the shapefile to leave the original intact
+states_shp2 <- states_shp %>% 
+  left_join(in_out_acs, by = c("STATE_NAME" = "STATENAME")) 
+
+p1 <- ggplot() +
+  geom_sf(data = states_shp2, aes(fill=netmig_acs), size=0.1) +
+  coord_sf(crs = "epsg:5070") +
+  geom_segment(aes(x = -2250000, y = 1050000, xend = -1500000, yend = 900000), size=0.2) +
+  geom_segment(aes(x = -1500000, y = 900000, xend = -600000, yend = 400000), size=0.2) +
+  scale_fill_distiller(name=' ', palette='RdBu',direction=1,
+                      limits=c(-260000,260000), 
+                      breaks=seq(-260000,260000, by =80000)) +
+  labs(title = "Netmigration, ACS 2022-2023") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title=element_blank(),
+        legend.key.size =  unit(0.5, "in"),
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=10),
+        plot.title = element_text(size=20,hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),        
+        plot.margin=unit(c(1, 1, 1, 1), "points"),
+        strip.background = element_rect(fill='white'),
+        strip.text.x = element_text(size = 10)) 
+
+p1
+
+```
+Do to its sheer size California dominates along with Florida Texas, and New york, but also North Carolina seems prime to be a significant gainer.
+
+# Migration Efficiency {.center}
+
+## Various Formulas used in for Migration Efficiency
+
+-   Netmigration is inmigration minus outmigration for a spatial unit (country, state, county etc)
+
+-   In notation:
+
+$$
+n_{ij} = t_{ji} - t_{ij}
+$$ \## Migration efficiency between two states
+
+-   We can calculate efficiency for flows between states $i$ and $j$, $E_{ij}$:
+
+$$E_{ij}= 100\Bigg[ \frac{(t_{ji} - t_{ij})}{(t_{ij} + t_{ji})}\Bigg]$$ We can compute this measure for all flows in and out of a single state, $E_i$
+
+$$E_i= 100\Bigg[ \frac{(In_i - Out_i)}{(In_i + Out_i)}\Bigg]$$ where
+
+$$In_i = \sum\limits_{\substack{i \\ i\neq j}}t_{ij}, \:\:\:\: Out_i = \sum\limits_{\substack{j \\ i\neq j}}t_{ij}$$
+
+National migration efficiency, $E$, is:
+
+$$E = 100\Bigg[ \frac{\sum_i|In_i - Out_i|}{\sum_i(In_i + Out_i)}\Bigg]$$ \## Compute aggregate state and national efficiencies for ACS
+
+```{r}
+
+# state efficiencies ACS
+in_out_acs <- in_out_acs %>% 
+  mutate(efficiency_acs=100*(netmig_acs/(inflow_acs+outflow_acs))) 
+
+# national efficiency ACS
+national_eff_acs <- in_out_acs %>%
+  ungroup() %>% 
+  summarize(national_efficiency_acs=100*(sum(abs(netmig_acs)/sum(inflow_acs+outflow_acs)))
+  )
+
+gt(national_eff_acs) 
+
+in_out_acs %>% 
+  ungroup() %>% 
+  head(20) %>% 
+  gt()  
+
+```
+
+## Plot ranked aggregate state efficiencies - ACS
+
+```{r}
+p1 <- ggplot(in_out_acs, aes(y=efficiency_acs,x=reorder(STATENAME, desc(efficiency_acs)))) +
+  geom_bar(stat="identity") +
+  scale_y_continuous(name=" ", 
+                     n.breaks = 20) +  
+  labs(title = "Migration Efficiency by State, ACS 2022-23") +
+  xlab(" ") +
+  theme(panel.background = element_rect(fill = 'white', color = 'white'),
+        panel.grid.major = element_line(color = 'darkgray', linetype = 'solid', size=0.2),
+        plot.title = element_text(size=16,hjust = 0.5),
+        plot.subtitle = element_text(size=12, hjust = 0.5),
+        axis.title.x = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7)) +
+  coord_flip()
+
+p1
+
+```
+We will graph these rates, but noticeably District of Columbia which we will not be able to see also stands as a significant loser, along with the west coast losing overall.
+
+## Map state aggregate migration efficiency - ACS
+
+```{r}
+# join efficiency data to shapefile
+states_shp2 <- states_shp2 %>% 
+  left_join(in_out_acs, by = c("STATE_NAME" = "STATENAME")) 
+
+ggplot() +
+  geom_sf(data = states_shp2, aes(fill=efficiency_acs), size=0.1) +
+  coord_sf(crs = "epsg:5070") +
+  scale_fill_gradient2(name=' ', low="red", mid="white", high="blue",  midpoint=0, breaks=waiver(), n.breaks=8) +
+  labs(title = "ACS Migration Efficiency, 2022-23") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title=element_blank(),
+        legend.key.size =  unit(0.4, "in"),
+        legend.text = element_text(size=9),
+        legend.title = element_text(size=10),
+        plot.title = element_text(size=20,hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),        
+        plot.margin=unit(c(1, 1, 1, 1), "points"),
+        strip.background = element_rect(fill='white'),
+        strip.text.x = element_text(size = 10)) 
+
+```
+Accounting for population and efficiency, California, New York, New jersey, and Illinois still are some of the largest losers but smaller states like New Hampshire, Louisiana, and Kansas also experience loss. The Carolinas gain a lot in net migration but also efficiency while smaller population states like Idaho, North Dakota, Maine, and Oklahoma are seeing growth presumably in cities like Boise, Fargo, Portland (ME), and OKC and Tulsa. 
+
+## Map aggregate state migration efficiency again using a function - ACS
+
+```{r}
+
+map_mig <- function(data, var, title){
+ggplot() +
+  geom_sf(data = data, aes(fill={{var}}), size=0.1) +
+  coord_sf(crs = "epsg:5070") +
+  scale_fill_gradient2(name=' ', low="red", mid="white", high="blue",  midpoint=0, breaks=waiver(), n.breaks=8) +
+  labs(title = title) +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title=element_blank(),
+        legend.key.size =  unit(0.4, "in"),
+        legend.text = element_text(size=9),
+        legend.title = element_text(size=10),
+        plot.title = element_text(size=20,hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),        
+        plot.margin=unit(c(1, 1, 1, 1), "points"),
+        strip.background = element_rect(fill='white'),
+        strip.text.x = element_text(size = 10)) 
+  
+}
+
+
+```
+
+## Plot of aggregate state migration efficiency - ACS using our new function
+
+```{r}
+#| code-fold: false
+p_eff_acs <- map_mig(states_shp2, efficiency_acs, "ACS Migration Efficiency, 2022-23")
+
+p_eff_acs
+```
+Same as the above map just using a function
+
+## Creating the migration flows based on education levels
+
+```{r}
+
+state_flows_education_acs <- data %>% 
+  filter(mover==1) %>% 
+  mutate(Education=case_when(
+    EDUCD <= 64 ~ "HS or Less",
+    EDUCD >=65 & EDUCD <=100 ~ "Some College",
+    EDUCD >= 101 & EDUCD <= 113 ~ "BA degree",
+    EDUCD >= 114 ~ "Advanced Degree")) %>%
+  filter(Education == "HS or Less" | Education == "Some College" | Education == "BA degree" | Education == "Advanced Degree") %>%
+  group_by(PREV_STATENAME, STATENAME, Education) %>% 
+  summarize(flow=sum(PERWT)) %>% 
+  ungroup() %>% 
+  complete(PREV_STATENAME, STATENAME, Education, fill = list(flow = 0))
+
+```
+
+## Summarize state flow by education data
+
+```{r}
+in_out_educ_acs <- state_flows_education_acs %>% 
+  group_by(PREV_STATENAME, Education) %>% 
+  mutate(outflow_educ_acs=sum(flow)) %>% 
+  group_by(STATENAME, Education) %>% 
+  mutate(inflow_educ_acs=sum(flow)) %>% 
+  select(PREV_STATENAME,STATENAME, Education, outflow_educ_acs, inflow_educ_acs) %>% 
+  filter(PREV_STATENAME==STATENAME) %>% 
+  mutate(netmig_acs=inflow_educ_acs-outflow_educ_acs) %>% 
+  select(-PREV_STATENAME)
+
+```
+
+## Create function for Education Migration Bar Graphs
+
+```{r}
+educ_bar_mig <- function(data, categ, var, title, max){
+  ggplot(data %>% filter(Education==categ), 
+  aes(y={{var}}, x=reorder(STATENAME, desc({{var}})))) +
+  geom_bar(stat="identity") +
+  labs(title = title) +
+  scale_y_continuous(name=" ", limits=c(-max,max), breaks=seq(-max,max, by = max/5)) +
+  xlab(" ") +
+  theme(text=element_text(size=12),
+        legend.title=element_blank(),
+        legend.key.size =  unit(0.3, "in"),
+        legend.text = element_text(size=9),
+        plot.title = element_text(size=16,hjust = 0.5),
+        plot.subtitle = element_text(size=12, hjust = 0.5),
+        axis.title.x = element_text(size = 10),
+        axis.title.y = element_text(size = 10),
+        axis.text.x = element_text(size = 7),
+        axis.text.y = element_text(size = 7)) +
+  coord_flip()
+}
+
+```
+
+# We look at Net Migration by Each Education Group
+
+## Advanced Degrees
+
+```{r}
+#| code-fold: false
+
+educ_bar_mig(in_out_educ_acs, "Advanced Degree", netmig_acs, "ACS Net Migration by Advanced Degrees, 2022-23", 30000)
+
+```
+Florida experiencing a surprising amount of gains possibly related to good weather or other reasons.
+
+## Bachelor's Degrees
+
+```{r}
+#| code-fold: false
+
+educ_bar_mig(in_out_educ_acs, "BA degree", netmig_acs, "ACS Net Migration by BA Degree Holders, 2022-23", 50000)
+
+```
+Again Florida gaining a lot along with Texas, Colorado, and the Carolinas.
+
+## Some College
+
+```{r}
+#| code-fold: false
+
+educ_bar_mig(in_out_educ_acs, "Some College", netmig_acs, "ACS Net Migration by Some College, 2022-23", 100000)
+
+```
+Illinois also loses a decent bit compared to the larger California and New York.
+
+## HS or Less
+
+```{r}
+#| code-fold: false
+
+educ_bar_mig(in_out_educ_acs, "HS or Less", netmig_acs, "ACS Net Migration by HS or Less, 2022-23", 120000)
+```
+We will graph this to see how staunch the differences are
+
+## Make a function to graph different educations migration
+
+```{r}
+states_shp3 <- states_shp %>%
+  right_join(in_out_educ_acs, by = c("STATE_NAME" = "STATENAME"))
+
+ggplot() +
+  geom_sf(data = states_shp3, aes(fill=netmig_acs), size=0.1) +
+  coord_sf(crs = "epsg:5070") +
+  scale_fill_gradient2(name=' ', low="red", mid="white", high="blue",  midpoint=0, breaks=waiver(), n.breaks=8) +
+  labs(title = "ACS Netmigration by Education, 2022-23") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title=element_blank(),
+        legend.key.size =  unit(0.4, "in"),
+        legend.text = element_text(size=9),
+        legend.title = element_text(size=10),
+        plot.title = element_text(size=20,hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),        
+        plot.margin=unit(c(1, 1, 1, 1), "points"),
+        strip.background = element_rect(fill='white'),
+        strip.text.x = element_text(size = 10)) +
+  facet_wrap(~Education)
+
+```
+With Net Migration the largest states dominate the color spectrum here with California being the biggest loser especially in lower levels of education while Texas picks up thousands in every category except for Some College.
+
+## Calculate Migration Efficiency
+
+```{r}
+in_out_educ_acs <- in_out_educ_acs %>% 
+  mutate(efficiency_acs=100*(netmig_acs/(inflow_educ_acs+outflow_educ_acs))) 
+
+# national efficiency
+national_eff_educ_acs <- in_out_educ_acs %>%
+  group_by(Education) %>% 
+  summarize(national_efficiency_acs=100*(sum(abs(netmig_acs)/sum(inflow_educ_acs+outflow_educ_acs)))
+  )
+
+tab1 <- gt(national_eff_educ_acs) 
+
+tab2 <- in_out_educ_acs %>% 
+  ungroup() %>% 
+  head(20) %>% 
+  gt() 
+```
+
+::: panel-tabset
+### National efficiencies
+
+```{r}
+tab1
+```
+
+### State efficiencies
+
+```{r}
+tab2
+```
+:::
+
+# Display bar graphs of State Migration Efficiency by level of Education
+
+## Advanced Degree
+
+```{r}
+#| code-fold: false
+
+educ_bar_mig(in_out_educ_acs, "Advanced Degree", efficiency_acs, "ACS Migration Efficiency by Advanced Degree, 2022-23", 35)
+```
+Both Dakotas and North Carolina are gaining a decent bit here but Maine and Alaska are surprisingly gaining a lot possibly related to environmental and biological science research I would guess as both states have very barren regions.
+
+## Bachelors Degree
+
+```{r}
+#| code-fold: false
+
+educ_bar_mig(in_out_educ_acs, "BA degree", efficiency_acs, "ACS Migration Efficiency by Bachelors Degree Holders, 2022-23", 30)
+```
+North Dakota is losing a lot of Bachelors Degrees contrary to other levels of education. Hawaii notably is gaining a decent bit perhaps people are attracted by the weather but North Carolina's Research Triangle is likely responsible for the largest gain here.
+
+## Some College
+
+```{r}
+#| code-fold: false
+
+educ_bar_mig(in_out_educ_acs, "Some College", efficiency_acs, "ACS Migration Efficiency by Some College, 2022-23", 55)
+```
+Both Carolinas seem to continue to gain but North Dakota is quite high here. I would chalk this up to an oil boom and perhaps growing business in Fargo.
+
+## HS or Less
+
+```{r}
+#| code-fold: false
+
+educ_bar_mig(in_out_educ_acs, "HS or Less", efficiency_acs, "ACS Migration Efficiency by HS or Less, 2022-23", 40)
+```
+Delaware is the largest gainer, something I find random as with the lowest education, Delaware is known ast the hub of fortune 500 companies due to Delaware's Court of Chancery's business friendly laws, who you think would attract more people of higher degrees instead. Some of the other larger gainers make a lot of sense as they are larger states with more while large states lose the most, as well as New Hampshire, perhaps people leaving to find jobs elsewhere.
+
+## Map Migration Efficiency by State by Education Level
+
+```{r}
+states_shp3 <- states_shp %>%
+  right_join(in_out_educ_acs, by = c("STATE_NAME" = "STATENAME"))
+
+ggplot() +
+  geom_sf(data = states_shp3, aes(fill=efficiency_acs), size=0.1) +
+  coord_sf(crs = "epsg:5070") +
+  scale_fill_gradient2(name=' ', low="red", mid="white", high="blue",  midpoint=0, breaks=waiver(), n.breaks=8) +
+  labs(title = "ACS Migration Efficiency by Education, 2022-23") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title=element_blank(),
+        legend.key.size =  unit(0.4, "in"),
+        legend.text = element_text(size=9),
+        legend.title = element_text(size=10),
+        plot.title = element_text(size=20,hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),        
+        plot.margin=unit(c(1, 1, 1, 1), "points"),
+        strip.background = element_rect(fill='white'),
+        strip.text.x = element_text(size = 10)) +
+  facet_wrap(~Education)
+
+```
+Among the Advanced Degrees there seems to be many states in the midwest losing and states in the more sparse third of american (Mountain Time states). New York and California lose quite a bit around all levels of education especially on lower levels of education. North Dakota sticks out like a sore thumb in the some college level possibly related to the oil boom of people going to trade school? Maine and some SEC states also see gains around every level except for some states losing out on Advanced Degree holders.
+
+
+# Now onto IRS data by Counties
+
+## Read in IRS Data
+
+```{r}
+dataIRS_co <- read_csv(file.path(dataDir,"countyoutflow2122.csv")) 
+
+dataIRS_ci <- read_csv(file.path(dataDir,"countyinflow2122.csv")) 
+
+gt(head(dataIRS_co))
+
+gt(head(dataIRS_ci))
+
+```
+
+## Calculating the inflow and outflow of counties
+
+```{r}
+
+# Use the sprintf function to ensure that the state and county codes are 2 and 3
+# digit character codes respectively
+out_irs_c <- dataIRS_co %>% 
+  filter(y2_statefips == 97 & str_detect(y2_countyname, "Total Migration-US")) %>% 
+  select(STATEFP=y1_statefips, COUNTYFP=y1_countyfips, outflow_irsc=n2) %>% 
+  mutate(STATEFP = sprintf("%02d", STATEFP),
+         COUNTYFP = sprintf("%03d", COUNTYFP)
+  )
+
+in_irs_c <- dataIRS_ci %>% 
+  filter(y1_statefips == 97 & str_detect(y1_countyname, "Total Migration-US")) %>% 
+  select(STATEFP=y2_statefips, COUNTYFP=y2_countyfips, inflow_irsc=n2) %>% 
+  mutate(STATEFP = sprintf("%02d", STATEFP),
+         COUNTYFP = sprintf("%03d", COUNTYFP)
+  )
+
+in_out_irsc1 <- out_irs_c %>% 
+  anti_join(in_irs_c)
+
+in_out_irsc2 <- in_irs_c %>% 
+  anti_join(out_irs_c)
+
+in_out_irsc <- out_irs_c %>% 
+  full_join(in_irs_c)
+
+# create a statecountynames file with state and county fips and county names.
+# the county shape file has these variables.  then merge with statenames for
+# state names. no need for polygon geometry so drop.
+countynames <- counties_shp %>% 
+  select(STATEFP, COUNTYFP, COUNTY_NAME=NAME) %>%
+  st_drop_geometry() %>% 
+  select(STATEFP, COUNTYFP, COUNTY_NAME)
+
+# join the in and out county files, start with the full set of state and county
+# names from statecountynames so that all counties included.  set missing
+# inflows or outflows to 0
+in_out_irs_c <- countynames %>% 
+  left_join(out_irs_c) %>% 
+  left_join(in_irs_c) %>% 
+  replace(is.na(.), 0) %>% 
+  mutate(netmig_irsc=inflow_irsc-outflow_irsc)
+  
+```
+
+```{r}
+counties_shp <- counties_shp %>% 
+  left_join(in_out_irs_c) 
+
+ggplot() +
+  geom_sf(data = counties_shp, aes(fill=netmig_irsc), size=0.1) +
+  coord_sf(crs = "epsg:5070") +
+  geom_segment(aes(x = -2250000, y = 1050000, xend = -1500000, yend = 900000), size=0.2) +
+  geom_segment(aes(x = -1500000, y = 900000, xend = -600000, yend = 400000), size=0.2) +
+  scale_fill_distiller(name=' ', palette='RdBu',direction=1,
+                      limits=c(-120000,120000), 
+                      breaks=seq(-120000,120000, by =20000)) +
+  labs(title = "Netmigration IRS, 2021-22") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title=element_blank(),
+        legend.key.size =  unit(0.4, "in"),
+        legend.text = element_text(size=9),
+        legend.title = element_text(size=10),
+        plot.title = element_text(size=20,hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),        
+        plot.margin=unit(c(1, 1, 1, 1), "points"),
+        strip.background = element_rect(fill='white'),
+        strip.text.x = element_text(size = 10)) 
+
+```
+Only the really major urban areas in California, Seattle, and around Chicago however LA county is by far the dominant color on this which is why we will attempt another method of representing net migration of counties.
+
+## Creating Deciles to map counties in a less skewed way
+
+```{r}
+
+in_out_irs_c1 <- in_out_irs_c %>% 
+  mutate(netmig_dec = ntile(netmig_irsc,10)) %>% 
+  group_by(netmig_dec) %>% 
+  mutate(min_dec=min(netmig_irsc),
+         max_dec=max(netmig_irsc)) %>% 
+  mutate(min_max=paste0(as.character(min_dec)," to ",as.character(max_dec))) %>% 
+  select(STATEFP, COUNTYFP, netmig_dec, min_dec, max_dec, min_max)
+
+
+in_out_irs_c1 %>% 
+  ungroup() %>% 
+  head() %>% 
+  gt()
+
+
+```
+
+```{r}
+
+counties_shp <- counties_shp %>% 
+  left_join(in_out_irs_c1) 
+
+ggplot() +
+  geom_sf(data = counties_shp, aes(fill=fct_reorder(as.factor(min_max), netmig_dec)), size=0.1) +
+  coord_sf(crs = "epsg:5070") +
+  scale_fill_brewer(palette = "RdBu") +
+  geom_segment(aes(x = -2250000, y = 1050000, xend = -1500000, yend = 900000), size=0.2) +
+  geom_segment(aes(x = -1500000, y = 900000, xend = -600000, yend = 400000), size=0.2) +
+  labs(title = "Netmigration IRS, 2021-2022",
+       subtitle = "Deciles",
+       fill = "  ") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title=element_blank(),
+        legend.key.size =  unit(0.2, "in"),
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=10),
+        plot.title = element_text(size=20,hjust = 0.5),
+        plot.subtitle = element_text(size=15, hjust = 0.5),        
+        plot.margin=unit(c(1, 1, 1, 1), "points"),
+        strip.background = element_rect(fill='white'),
+        strip.text.x = element_text(size = 10)) 
+
+
+```
+When we place this into population deciles we see a much different picture that is not skewed by the massive population of California which still has a significant impact, but we see broader the loss across the midwest and gains in much more urban areas especially in the East and urban areas of Texas.
+
+## Calculate Migration efficiencies for Counties and Map that
+
+```{r}
+in_out_irs_c2 <- in_out_irs_c %>%
+  mutate(efficiency_irs=100*(netmig_irsc/(inflow_irsc+outflow_irsc)))
+
+counties_shp2 <- counties_shp %>%
+  left_join(in_out_irs_c2)
+
+ggplot() +
+  geom_sf(data = counties_shp2, aes(fill=efficiency_irs), size=0.1) +
+  coord_sf(crs = "epsg:5070") +
+  scale_fill_gradient2(name=' ', low="red", mid="white", high="blue",  midpoint=0, breaks=waiver(), n.breaks=8) +
+  labs(title = "ACS Migration Efficiency by Education, 2022-23") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title=element_blank(),
+        legend.key.size =  unit(0.4, "in"),
+        legend.text = element_text(size=9),
+        legend.title = element_text(size=10),
+        plot.title = element_text(size=20,hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),        
+        plot.margin=unit(c(1, 1, 1, 1), "points"),
+        strip.background = element_rect(fill='white'),
+        strip.text.x = element_text(size = 10))
+```
+
+We can see many counties in the midwest and parts of Montana and the Dakotas are really suffering as well as Alaska. Meanwhile the western part of Montana, Idaho, and Utah are seeing gains. Several rural counties in Eastern Colorado and Western Nebraska as well as one Nevada county show significant loss. Texas for the most part gains in the more urban counties while experiencing significant losses in some of the more rural west and southern counties. Some data is also missing likely due to areas where data might not be collected on the county level.

@@ -1,0 +1,416 @@
+---
+title: "Tech Migration to the Seattle Metro Area"
+subtitle: "And Across the United States"
+author: "Gavin Morrow"
+date: today
+date-format: "MMM D, YYYY"
+execute:
+  enabled: true
+  echo: true
+  warning: false
+  message: false   
+format:
+  revealjs:
+    scrollable: true
+    embed-resources: true 
+    code-fold: true
+    code-overflow: wrap
+    slide-number: true
+---
+
+## Objectives
+- Understand the difference in migration for tech jobs in relation to overall migration patterns
+
+- See how this correlates with different years in this century with different economic times
+
+- Attempt to make predictions about the future of tech migration in the Seattle Metro Area
+
+## Methods and Data
+- Data: ACS 2024, 2021, 2016, 2006 years chosen for different times + State and County shapefiles
+
+- Define and filter for someone migrating for a tech job
+
+- Create Migration Efficiency graphs of County and State for tech migration 
+
+- Compare Migration trends between chosen years
+
+```{r}
+#| output: false
+library(ipumsr)
+library(tidyverse)
+library(gt)
+library(scales)
+library(sf) 
+
+# wkdir is the root of your project directory
+wkdir <- here::here()
+
+# set directories for where you store data and save plots relative to project root
+dataDir <- file.path(wkdir, "data")  #read data file dir
+plotsDir <- file.path(wkdir, "plots")  #save plot files dir
+
+options(scipen=99, digits=5)
+
+# create plots directory if it does not exist
+ifelse(!dir.exists(file.path(wkdir, "plots")), dir.create(file.path(wkdir, "plots")), FALSE)
+
+
+options(scipen=99, digits = 5)
+```
+
+```{r}
+#| output: false
+
+if (!require("ipumsr")) stop("Reading IPUMS data into R requires the ipumsr package. It can be installed using the following command: install.packages('ipumsr')")
+
+dataSet <- "usa_00007.xml"  # name of YOUR 2023 xml file
+
+ddi <- read_ipums_ddi(file.path(dataDir,dataSet)) # ACS 2023
+data <- read_ipums_micro(ddi)
+
+# extract variable names the traditional way (useful reference)
+varname <- as.data.frame(colnames(data))
+
+# create webpage of variable names, labels and values, save it as dataSet.html in the data directory
+# useful for reference
+ipums_view(ddi, launch = FALSE, out_file=file.path(wkdir, "data", paste0(dataSet,".html" )))
+
+# add a state name variable to data 
+# first, create a dataframe with statefips codes (as val) and statenames (as lbl) from variable STATEIP
+STATES <- ipums_val_labels(ddi, STATEFIP) 
+
+# then, join STATES to data (using: STATEFIP=val) and rename new variable lbl as STATENAME
+data <- data %>% 
+  left_join(select(STATES, STATEFIP=val, STATENAME=lbl))
+
+# drop those who lived outside the US 1 year ago and those < 1 year old
+# assign current state of residence to previous state for those who didn't move
+# (i.e. MIGPLAC1=0)
+data <- data %>%
+  filter(AGE >=1, MIGPLAC1<=56) %>% 
+  mutate(MIGPLAC1=case_when(
+    MIGPLAC1 == 0 ~ STATEFIP,
+    TRUE ~ as.integer(MIGPLAC1)))
+
+
+# make a new variable called PREV_STATENAME from MIGPLAC1 labels
+MIGPLAC1 <- ipums_val_labels(ddi, MIGPLAC1)  
+
+# add MIGPLAC1 labels to our data extract as new variable PREV_STATENAME
+data <- data %>% 
+  left_join(select(MIGPLAC1, MIGPLAC1=val, PREV_STATENAME=lbl))
+
+
+## Read Shapefiles
+
+states_shp <- st_read(file.path(wkdir, "Shapefiles", "states_moveAKHI.shp"),"states_moveAKHI", quiet = TRUE)
+
+counties_shp <- st_read(file.path(wkdir, "Shapefiles",
+"counties_moveAKHI.shp"), "counties_moveAKHI", quiet = TRUE)
+```
+
+
+ 
+```{r}
+#| output: false
+
+# create an indicator of interstate migration: mover=1, stayers/non-movers=0
+data <- data %>% 
+  mutate(mover=case_when(STATENAME != PREV_STATENAME ~ 1,
+                         TRUE ~ 0))
+
+state_flows_acs <- data %>% 
+  filter(mover==1) %>% 
+  group_by(PREV_STATENAME, STATENAME) %>% 
+  summarize(flow=sum(PERWT)) 
+
+state_flows_acs <- data %>% 
+  filter(mover==1) %>% 
+  group_by(PREV_STATENAME, STATENAME) %>% 
+  summarize(flow=sum(PERWT)) %>% 
+  ungroup() %>% 
+  complete(PREV_STATENAME, STATENAME, fill = list(flow = 0))
+
+  
+```
+## FIPS Code Translation
+Have to convert to string in order to match with counties shape file and convert dbl to strings and pad for them to match
+- as.character to change type
+- str_pad to add 0's so keys match for join
+```{r}
+#| code-line-numbers: true
+#| output: true
+
+data <- data %>%
+  mutate(
+    STATEFIP = str_pad(as.character(STATEFIP),  width = 2, side = "left", pad = "0"),
+    COUNTYFIP = str_pad(as.character(COUNTYFIP), width = 3, side = "left", pad = "0")
+  )
+
+```
+
+```{r}
+county_fips <- counties_shp %>%
+  select(STATEFP, COUNTYFP, COUNTYNAME = NAME) %>%
+  st_drop_geometry()
+
+data_county <- county_fips %>%
+  left_join(county_fips, by = c("STATEFP", "COUNTYFP"))
+```
+
+```{r}
+#| output: false 
+
+in_out_acs_state <- state_flows_acs %>% 
+  group_by(PREV_STATENAME) %>% 
+  mutate(outflow_acs=sum(flow)) %>% 
+  group_by(STATENAME) %>% 
+  mutate(inflow_acs=sum(flow)) %>% 
+  select(PREV_STATENAME,STATENAME, outflow_acs, inflow_acs) %>% 
+  filter(PREV_STATENAME==STATENAME) %>% 
+  mutate(netmig_acs=inflow_acs-outflow_acs) %>% 
+  select(-PREV_STATENAME)
+  
+```
+
+```{r}
+#| output: false
+
+# state efficiencies ACS
+in_out_acs_state <- in_out_acs_state %>% 
+  mutate(efficiency_acs=100*(netmig_acs/(inflow_acs+outflow_acs))) 
+
+# national efficiency ACS
+national_eff_acs <- in_out_acs_state %>%
+  ungroup() %>% 
+  summarize(national_efficiency_acs=100*(sum(abs(netmig_acs)/sum(inflow_acs+outflow_acs)))
+  )
+```
+
+## Defining Tech Jobs
+- 3341-3346 (Computer, Communication and Related Manufacturing)
+- 3351, 3353, & 3359 (Electrical Components)
+- 336411-336419 (Aircraft and Space Part Manufacturing)
+- 5132 (Software Publishers)
+- 5182 (Computing Infrastructure, Data Processing, Web Hosting)
+- 517 and 517111 (Wired and Wireless Telecomm)
+- 5415-5417 (Computer Systems Design, Tech Consulting, Scientific Research)
+
+```{r}
+#| code-line-numbers: true
+
+tech_data <- data %>%
+  filter(mover==1) %>% ## Migrating Between States
+  filter(EDUCD >= 101) %>%  ## Bachelor's or more Advanced Degree
+  filter((INDNAICS >= 3341 & INDNAICS <= 3359 & INDNAICS != 3352) |
+  (INDNAICS >= 336411 & INDNAICS <= 336419) |
+  INDNAICS == 5132 | 
+  INDNAICS == 5182 |
+  INDNAICS == 517 |
+  INDNAICS == 517111 |
+  (INDNAICS >= 5415 & INDNAICS <= 5417))
+
+```
+
+## Seattle Metro Area
+### WA FIPS Code is 53
+- King County is 033
+- Snohomish is 061
+- Pierce is 053
+
+```{r}
+county_flow_acs <- data %>% 
+  filter(mover==1) %>% 
+  group_by(PREV_STATENAME, STATENAME, COUNTYFIP) %>% 
+  summarize(flow=sum(PERWT)) %>% 
+  ungroup() %>% 
+  complete(PREV_STATENAME, STATENAME, COUNTYFIP, fill = list(flow = 0))
+
+county_flow_acs_tech <- tech_data %>%
+  filter(mover==1) %>% 
+  group_by(PREV_STATENAME, STATENAME, COUNTYFIP) %>% 
+  summarize(flow=sum(PERWT)) %>% 
+  ungroup() %>% 
+  complete(PREV_STATENAME, STATENAME, COUNTYFIP, fill = list(flow = 0))
+  
+
+state_flow_acs_tech <- tech_data %>% 
+  filter(mover==1) %>% 
+  group_by(PREV_STATENAME, STATENAME) %>% 
+  summarize(flow=sum(PERWT)) %>% 
+  ungroup() %>% 
+  complete(PREV_STATENAME, STATENAME, fill = list(flow = 0))
+
+```
+
+
+```{r}
+in_out_acs_tech <- state_flow_acs_tech %>% 
+  group_by(PREV_STATENAME) %>% 
+  mutate(outflow_acs=sum(flow)) %>% 
+  group_by(STATENAME) %>% 
+  mutate(inflow_acs=sum(flow)) %>% 
+  select(PREV_STATENAME,STATENAME, outflow_acs, inflow_acs) %>% 
+  filter(PREV_STATENAME==STATENAME) %>% 
+  mutate(netmig_acs=inflow_acs-outflow_acs) %>% 
+  select(-PREV_STATENAME)
+```
+
+```{r}
+in_out_acs_tech <- in_out_acs_tech %>% 
+  mutate(efficiency_acs=100*(netmig_acs/(inflow_acs+outflow_acs)))
+```
+
+## Tech Migration Efficiency
+
+```{r}
+#| echo: false
+bar1 <- ggplot(
+  in_out_acs_tech %>%
+    arrange(desc(efficiency_acs)) %>%
+    slice_head(n = 20),
+  aes(x = fct_rev(fct_reorder(STATENAME, efficiency_acs)), y = efficiency_acs)
+) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "States by Tech Migration Efficiency",
+    x = "State",
+    y = "Migration Efficiency"
+  ) +
+  theme_minimal(base_size = 12) + 
+  theme(
+  axis.text.y = element_text(size = 7)
+)
+
+print(bar1)
+
+```
+
+## Now Graphed
+```{r}
+states_shp2 <- states_shp %>% 
+  left_join(in_out_acs_tech, by = c("STATE_NAME" = "STATENAME")) 
+
+p1 <- ggplot() +
+  geom_sf(data = states_shp2, aes(fill=efficiency_acs), size=0.1) +
+  coord_sf(crs = "epsg:5070") +
+  geom_segment(aes(x = -60, y = 60, xend = -60, yend = 60), size=0.2) +
+  scale_fill_distiller(name=' ', palette='RdBu',direction=1,
+                      limits=c(-60,60), 
+                      breaks=seq(-60,60, by =15)) +
+  labs(title = "Tech Migration Efficiency All 4 Years") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_blank(), 
+        axis.text.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title=element_blank(),
+        legend.key.size =  unit(0.5, "in"),
+        legend.text = element_text(size=12),
+        legend.title = element_text(size=10),
+        plot.title = element_text(size=20,hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5),        
+        plot.margin=unit(c(1, 1, 1, 1), "points"),
+        strip.background = element_rect(fill='white'),
+        strip.text.x = element_text(size = 10)) 
+
+print(p1)
+
+```
+
+## Now Graphed by the Different Years
+
+```{r}
+state_flow_acs_tech_years <- tech_data %>% 
+  filter(mover==1) %>% 
+  group_by(PREV_STATENAME, STATENAME, YEAR) %>% 
+  summarize(flow=sum(PERWT)) %>% 
+  ungroup() %>% 
+  complete(PREV_STATENAME, STATENAME, YEAR, fill = list(flow = 0))
+
+in_out_acs_tech_years <- state_flow_acs_tech_years %>% 
+  group_by(PREV_STATENAME, YEAR) %>% 
+  mutate(outflow_acs=sum(flow)) %>% 
+  group_by(STATENAME, YEAR) %>% 
+  mutate(inflow_acs=sum(flow)) %>% 
+  select(PREV_STATENAME,STATENAME, YEAR, outflow_acs, inflow_acs) %>% 
+  filter(PREV_STATENAME==STATENAME) %>% 
+  mutate(netmig_acs=inflow_acs-outflow_acs) %>% 
+  select(-PREV_STATENAME)
+
+
+in_out_acs_tech_years <- in_out_acs_tech_years %>% 
+  mutate(efficiency_acs=100*(netmig_acs/(inflow_acs+outflow_acs)))
+```
+
+```{r}
+states_shp3 <- states_shp %>% 
+  left_join(in_out_acs_tech_years, by = c("STATE_NAME" = "STATENAME")) 
+
+p2 <- ggplot() +
+  geom_sf(data = states_shp3, aes(fill = efficiency_acs), size = 0.1) +
+  coord_sf(crs = "epsg:5070") +
+  scale_fill_distiller(
+    name = ' ',
+    palette = 'RdBu',
+    direction = 1,
+    limits = c(-75, 75),
+    breaks = seq(-75, 75, by = 15)
+  ) +
+  labs(title = "Tech Migration Efficiency All 4 Years") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_blank(),
+    axis.text.x = element_blank(),
+    axis.text.y = element_blank(),
+    axis.ticks = element_blank(),
+    axis.title = element_blank(),
+    legend.key.size = unit(0.5, "in"),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 10),
+    plot.title = element_text(size = 20, hjust = 0.5),
+    strip.background = element_rect(fill = 'white'),
+    strip.text.x = element_text(size = 10)
+  ) +
+  facet_wrap(~YEAR)
+
+print(p2)
+```
+
+## King County has the highest Flow from California
+```{r}
+county_flow_acs_tech %>%
+  arrange(desc(flow)) %>%
+  slice_head(n = 5) %>%      # first 5 rows 
+  gt()
+
+```
+
+## Tech focus Migration Efficiency vs General Migration Efficiency
+```{r}
+tech_val <- in_out_acs_tech %>%
+  filter(STATENAME == "Washington") %>%
+  pull(efficiency_acs)
+
+state_val <- in_out_acs_state %>%
+  filter(STATENAME == "Washington") %>%
+  pull(efficiency_acs)
+
+difference <- tech_val - state_val
+print("Tech Focused Migration has a higher Migration Efficiency by: ")
+print(difference)
+
+```
+
+## Conclusion
+- Will use IRS Data to to further county by county migration
+- It is difficult to define what a tech job is
+- Washington has had a decent amount of tech migration over the years 
+
+
+
